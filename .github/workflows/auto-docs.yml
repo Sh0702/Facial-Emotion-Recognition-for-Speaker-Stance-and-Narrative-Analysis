@@ -1,0 +1,96 @@
+name: Auto Docs
+
+on:
+  pull_request:
+    branches: [ main ]          # preview docs on PRs
+  push:
+    branches: [ main ]          # regenerate/commit after merge
+  workflow_dispatch:             # manual run
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write               # needed to commit docs back on push to main
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    environment: DOCS           # define secrets/vars in Repo Settings → Actions → Environments → DOCS
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # If you vendored docAider under tools/docaider, keep this.
+      # Otherwise, adapt to your path or pip install the package.
+      - name: Install deps
+        run: |
+          pip install -r tools/docaider/requirements.txt
+          # Install provider SDKs as needed:
+          pip install anthropic google-generativeai pandocfilters
+
+      - name: Generate docs (changed files only)
+        env:
+          # Choose your provider in the Environment or here:
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || secrets.LLM_PROVIDER }}   # "anthropic" or "gemini"
+          # Claude (Anthropic)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL:   ${{ secrets.ANTHROPIC_MODEL }}                # e.g., claude-3-5-sonnet-20240620
+          # Gemini
+          GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+          GEMINI_MODEL:      ${{ secrets.GEMINI_MODEL }}                   # e.g., gemini-1.5-pro
+        run: |
+          python tools/docaider/repo_documentation/multi_agent_app.py \
+            --only-changed \
+            --spec ./prompts || exit 1
+
+      - name: Assemble book.md
+        run: |
+          mkdir -p docs
+          echo "# Codebase Documentation" > docs/book.md
+          find docs_output -type f -name "*.md" | sort | xargs -I{} bash -lc 'echo >> docs/book.md; echo "---" >> docs/book.md; cat "{}" >> docs/book.md'
+
+      - name: Install Pandoc
+        uses: pandoc/actions/setup@v1
+
+      - name: Build DOCX & PDF
+        run: |
+          pandoc docs/book.md -o docs/book.docx
+          pandoc docs/book.md -o docs/book.pdf
+
+      - name: Upload artifacts (DOCX/PDF)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-bundle
+          path: |
+            docs/book.docx
+            docs/book.pdf
+
+      # Commit updated Markdown only on push to main (not on PRs)
+      - name: Commit updated docs_output
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/main') }}
+        run: |
+          if [ -n "$(git status --porcelain docs_output)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add docs_output
+            git commit -m "docs: auto-update"
+            git push
+          fi
